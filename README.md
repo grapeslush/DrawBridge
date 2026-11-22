@@ -35,7 +35,7 @@ A README typo deploys straight through. A change to your login route triggers ch
 
 ```mermaid
 flowchart LR
-    A["Claude runs a Bash command"] --> B{"Production deploy?<br/>wrangler deploy · pages deploy · git push main"}
+    A["Claude runs a Bash command"] --> B{"Production deploy?<br/>wrangler · npm scripts · make · git push main"}
     B -- no --> Z["✅ Runs normally"]
     B -- yes --> C["git diff since<br/>.drawbridge/last-reviewed"]
     C --> D{"Matches any of<br/>20 trigger patterns?"}
@@ -49,10 +49,11 @@ flowchart LR
 What Claude sees when the gate fires:
 
 ```text
-DRAWBRIDGE RAISED: changes in 9f3c2e1..HEAD match the checks below. Production deploy is blocked until they are reviewed.
+DRAWBRIDGE RAISED in /home/me/app: changes in 9f3c2e1 match the checks below. Production deploy is blocked until they are reviewed.
   5: app/api/login/route.ts
   20: app/api/login/route.ts
-Run /drawbridge for checks 5,20 only. Diff: git diff -U15 9f3c2e1..HEAD -- <files>
+Run /drawbridge for checks 5,20 only. Diff: git -C /home/me/app diff -U15 9f3c2e1 -- <files>
+After an all-PASS review, approve with: /home/me/app/.claude/skills/drawbridge/gate.sh --approve /home/me/app
 ```
 
 And the review that follows:
@@ -133,19 +134,31 @@ You mostly don't use it. Deploy as usual and Drawbridge steps in only when it's 
 | Command | What it does |
 |---|---|
 | `/drawbridge` | Run the review by hand on everything since the last reviewed deploy |
-| `.claude/skills/drawbridge/gate.sh --check` | Show which checks would fire, without writing anything |
-| `.claude/skills/drawbridge/gate.sh --approve` | Mark the current diff as reviewed. The skill runs this after an all-PASS review |
+| `.claude/skills/drawbridge/gate.sh --check [repo-dir]` | Show which checks would fire, without writing anything |
+| `.claude/skills/drawbridge/gate.sh --approve [repo-dir]` | Mark the current diff as reviewed. The skill runs this after an all-PASS review |
 | `SKIP_DRAWBRIDGE=1 wrangler deploy` | Emergency bypass, logged to `.drawbridge/skipped.log` |
 
 ### What counts as production
 
+The gate reads the command the way a shell would: it follows `cd`, subshells and `bash -c`, splits `&&`, `;` and `|` chains outside quotes, and looks inside package scripts, Makefiles and script files to find the deploy. Those files are read as text, never run. Quoted text (`git commit -m "…wrangler deploy…"`) and heredocs written to a file are not commands, so they don't trigger it; a heredoc fed to a shell (`bash <<EOF`) does.
+
 | Command | Gated when |
 |---|---|
-| `wrangler deploy` | no `--env`, or `--env production` |
-| `wrangler pages deploy` | `--branch` (or the current branch) is the production branch |
+| `wrangler deploy` / `publish` / `versions deploy` (also `npx`, `bunx`, `wrangler@x`, flags before the subcommand) | no `--env`, `-e` or `CLOUDFLARE_ENV`, or it names `production` / `prod`. Not with `--dry-run`, `versions upload` or `triggers deploy` |
+| `wrangler pages deploy` / `pages publish` | `--branch` (or the current branch) is the production branch |
+| `wrangler d1 migrations apply --remote` | same environment rule as `wrangler deploy` |
+| `opennextjs-cloudflare deploy` | same environment rule as `wrangler deploy` |
+| `npm` / `pnpm` / `yarn` / `bun` scripts (`npm run deploy`, `yarn ship`, `npm --prefix app run deploy`) | the script, its `pre`/`post` scripts, or anything they call deploys. Arguments are passed through, so `npm run deploy -- --env staging` is not prod |
+| `make <target>` / `just <recipe>` | the recipe or one of its prerequisites deploys |
+| `./deploy.sh`, `bash scripts/x.sh`, `node scripts/release.mjs`, `python deploy.py` | a shell script is followed line by line; other files are searched for `wrangler … deploy` or Workers / Pages upload API calls |
+| `turbo`, `nx`, `lerna`, `moon`, `rush`, `task`, `mise`, workspace filters (`pnpm --filter web run deploy`) | the task is named like `deploy`, `release` or `ship` (`web:deploy`, `deploy-prod`) and nothing says `staging`, `preview`, `dev`, `test` and so on |
 | `git push` | the destination is the production branch (`main`, `HEAD:main`, `+main`, `--all`, …) |
+| `gh pr merge` | always (except `--disable-auto`) |
+| `gh workflow run <wf>` | the workflow uses wrangler or a Cloudflare action |
+| `curl` / `wget` to `api.cloudflare.com` | it writes (PUT / POST / PATCH / form or file upload) to Workers scripts or Pages deployments |
+| `terraform` / `tofu` / `terragrunt apply`, `pulumi up` | the repo declares Workers or Pages resources |
 
-The production branch comes from `production_branch` in `wrangler.toml` / `wrangler.json(c)` and defaults to `main`.
+The production branch comes from `production_branch` in `wrangler.toml` / `wrangler.json(c)` and defaults to `main`. The repo that gets diffed is the one the deploy runs in (after any `cd` or `--prefix`), so it works when the session sits in a parent folder.
 
 ### What gets diffed
 
@@ -165,7 +178,9 @@ The production branch comes from `production_branch` in `wrangler.toml` / `wrang
 Drawbridge catches likely problems cheaply. It is not a full audit.
 
 - The triggers are regexes. Expect some false positives, and code that does the same thing under an unusual name can slip through.
-- Deploys wrapped in scripts (`npm run deploy` calling wrangler) aren't detected. Have Claude run `wrangler` directly, or add your script name to the fast-path regex in `gate.sh`.
+- Deploy detection follows scripts it can read. A deploy built from variables (`$DEPLOY_CMD`), `eval`, or a CI pipeline that deploys on its own schedule won't be seen.
+- `gh pr merge` and `gh workflow run` are checked against your local `HEAD`, not the PR's own commits. Check out the PR branch first.
+- Deploys that don't go through Bash (the Cloudflare dashboard, an MCP tool) aren't seen. `wrangler rollback` and `wrangler secret put` are not gated.
 - Untracked new files are included only once they're committed or staged.
 - The inline bypass works for Claude too. The skill tells Claude never to use it unless you ask, and every skip is logged.
 - Without git, the gate does nothing.
@@ -176,7 +191,7 @@ Drawbridge catches likely problems cheaply. It is not a full audit.
 ./test.sh
 ```
 
-The test builds a throwaway repo and checks 20 gate decisions: prod and non-prod commands, a README-only change, a login route change (checks 5 and 20 only), dependency bumps, the bypass, the approval flow, and working-tree vs. pushed diffs.
+The test builds a throwaway repo and checks 119 gate decisions: wrangler, package-script, make, script-file, monorepo, API and Terraform deploys against their staging and dry-run look-alikes; a deploy run from outside the repo; a README-only change; a login route change (checks 5 and 20 only); dependency bumps; the bypass and its secret redaction; the approval flow; and working-tree vs. pushed diffs.
 
 ## License
 

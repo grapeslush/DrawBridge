@@ -6,12 +6,12 @@ description: "Security review of changes before a Cloudflare production deploy, 
 # Drawbridge — production security gate
 
 ## Inputs
-- From the gate's block message: the check numbers, files, and RANGE.
-- Run manually with no block message: run `.claude/skills/drawbridge/gate.sh --check` and use its output. If it says nothing matched, report that and stop.
+- From the gate's block message: the repo path, the check numbers, files, RANGE, and the approve command.
+- Run manually with no block message: run `.claude/skills/drawbridge/gate.sh --check [repo-dir]` and use its output. If it says nothing matched, report that and stop.
 
 ## Token rules
 - Review ONLY the flagged checks. Skip every other check, even ones that look relevant.
-- Read the diff hunks only: `git diff -U15 <RANGE> -- <files>`. Open a whole file only when a hunk can't be judged without it. Never scan the repo.
+- Read the diff hunks only: `git -C <repo> diff -U15 <RANGE> -- <files>`. Open a whole file only when a hunk can't be judged without it. Never scan the repo.
 - Checks 2 and 17: inspect the built output, not the source. Find the dir from wrangler config (`pages_build_output_dir`, `assets.directory`), else the first of `out dist .vercel/output/static .open-next/assets build`. Run `find <dir> \( -name '.*' -o -name '*.map' \) | head`.
 - No tutorials, no background, no restating the diff.
 
@@ -46,5 +46,5 @@ One line per flagged check, nothing else:
 ## After the report
 - Any FAIL: do not deploy. Offer to apply the fixes. Once they're applied, rerun the deploy command so the gate checks the new diff.
 - No FAIL, but some NEEDS-HUMAN: ask the user to confirm those items, then continue as if all passed.
-- All PASS: run `.claude/skills/drawbridge/gate.sh --approve`, then rerun the original deploy command. The gate sees the approval, writes HEAD to `.drawbridge/last-reviewed`, and lets the deploy through.
+- All PASS: run the approve command from the block message (`gate.sh --approve <repo>`), then rerun the original deploy command. The gate sees the approval, writes HEAD to `.drawbridge/last-reviewed`, and lets the deploy through.
 - Never add `SKIP_DRAWBRIDGE=1` unless the user says to.
